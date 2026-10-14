@@ -5,10 +5,17 @@ import asyncio
 import tempfile
 import subprocess
 import os
+import time
 from pathlib import Path
 
 from utils import DETAILED_ERROR_LOGGING
 from config import DEFAULT_CONFIGS
+
+# Microsoft's TTS service occasionally returns no audio on a perfectly valid
+# request (rany2/edge-tts#473). Rather than surfacing that as a hard 500, retry
+# the whole request a few times with a short backoff before giving up.
+TTS_MAX_RETRIES = int(os.getenv("TTS_MAX_RETRIES", "3"))
+TTS_RETRY_BACKOFF_SECONDS = float(os.getenv("TTS_RETRY_BACKOFF_SECONDS", "1.5"))
 
 # Language default (environment variable)
 DEFAULT_LANGUAGE = os.getenv('DEFAULT_LANGUAGE', DEFAULT_CONFIGS["DEFAULT_LANGUAGE"])
@@ -42,29 +49,91 @@ def is_ffmpeg_installed():
     except (subprocess.CalledProcessError, FileNotFoundError):
         return False
 
+def _is_transient_tts_error(exc):
+    """Only retry errors that are likely to succeed on a fresh attempt.
+
+    ``NoAudioReceived`` is the known intermittent failure (rany2/edge-tts#473);
+    connection-level errors may also clear up on a retry. FFmpeg conversion
+    failures and malformed-request errors are not retried.
+    """
+    if isinstance(exc, edge_tts.exceptions.NoAudioReceived):
+        return True
+    try:
+        import aiohttp
+
+        if isinstance(exc, (aiohttp.ClientError, aiohttp.ClientConnectionError)):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 async def _generate_audio_stream(text, voice, speed):
     """Generate streaming TTS audio using edge-tts."""
     # Determine if the voice is an OpenAI-compatible voice or a direct edge-tts voice
     edge_tts_voice = voice_mapping.get(voice, voice)  # Use mapping if in OpenAI names, otherwise use as-is
-    
+
     # Convert speed to SSML rate format
     try:
         speed_rate = speed_to_rate(speed)  # Convert speed value to "+X%" or "-X%"
     except Exception as e:
         print(f"Error converting speed: {e}. Defaulting to +0%.")
         speed_rate = "+0%"
-    
-    # Create the communicator for streaming
-    communicator = edge_tts.Communicate(text=text, voice=edge_tts_voice, rate=speed_rate)
-    
-    # Stream the audio data
-    async for chunk in communicator.stream():
-        if chunk["type"] == "audio":
-            yield chunk["data"]
+
+    # The upstream service occasionally returns no audio on a valid request, so
+    # retry the whole stream a few times before surfacing the error.
+    last_exc = None
+    for attempt in range(1, TTS_MAX_RETRIES + 1):
+        try:
+            # Create the communicator for streaming
+            communicator = edge_tts.Communicate(text=text, voice=edge_tts_voice, rate=speed_rate)
+
+            # Stream the audio data
+            async for chunk in communicator.stream():
+                if chunk["type"] == "audio":
+                    yield chunk["data"]
+            return
+        except Exception as e:
+            last_exc = e
+            if attempt >= TTS_MAX_RETRIES or not _is_transient_tts_error(e):
+                raise
+            print(
+                f"TTS streaming attempt {attempt}/{TTS_MAX_RETRIES} failed "
+                f"({type(e).__name__}); retrying in "
+                f"{TTS_RETRY_BACKOFF_SECONDS * attempt}s"
+            )
+            time.sleep(TTS_RETRY_BACKOFF_SECONDS * attempt)
 
 def generate_speech_stream(text, voice, speed=1.0):
-    """Generate streaming speech audio (synchronous wrapper)."""
-    return asyncio.run(_generate_audio_stream(text, voice, speed))
+    """Yield audio chunks from the async edge-tts stream (synchronous generator).
+
+    ``asyncio.run`` cannot consume an async generator directly, so a background
+    thread runs the event loop and bridges chunks (and any final exception)
+    back through a thread-safe queue.
+    """
+    import threading
+    import queue as queue_module
+
+    chunk_queue = queue_module.Queue()
+
+    async def _produce():
+        try:
+            async for chunk in _generate_audio_stream(text, voice, speed):
+                chunk_queue.put(chunk)
+        except Exception as e:
+            chunk_queue.put(e)
+        finally:
+            chunk_queue.put(None)  # Sentinel marking end of stream
+
+    threading.Thread(target=lambda: asyncio.run(_produce()), daemon=True).start()
+
+    while True:
+        chunk = chunk_queue.get()
+        if chunk is None:
+            break
+        if isinstance(chunk, Exception):
+            raise chunk
+        yield chunk
 
 async def _generate_audio(text, voice, response_format, speed):
     """Generate TTS audio and optionally convert to a different format."""
@@ -82,9 +151,24 @@ async def _generate_audio(text, voice, response_format, speed):
         print(f"Error converting speed: {e}. Defaulting to +0%.")
         speed_rate = "+0%"
 
-    # Generate the MP3 file
-    communicator = edge_tts.Communicate(text=text, voice=edge_tts_voice, rate=speed_rate)
-    await communicator.save(temp_mp3_path)
+    # Generate the MP3 file. The upstream service occasionally returns no audio
+    # on a valid request, so retry a few times before surfacing the error.
+    last_exc = None
+    for attempt in range(1, TTS_MAX_RETRIES + 1):
+        try:
+            communicator = edge_tts.Communicate(text=text, voice=edge_tts_voice, rate=speed_rate)
+            await communicator.save(temp_mp3_path)
+            break
+        except Exception as e:
+            last_exc = e
+            if attempt >= TTS_MAX_RETRIES or not _is_transient_tts_error(e):
+                raise
+            print(
+                f"TTS attempt {attempt}/{TTS_MAX_RETRIES} failed "
+                f"({type(e).__name__}); retrying in "
+                f"{TTS_RETRY_BACKOFF_SECONDS * attempt}s"
+            )
+            time.sleep(TTS_RETRY_BACKOFF_SECONDS * attempt)
     temp_mp3_file_obj.close() # Explicitly close our file object for the initial mp3
 
     # If the requested format is mp3, return the generated file directly
